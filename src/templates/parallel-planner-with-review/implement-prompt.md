@@ -1,16 +1,32 @@
 # TASK
 
-Fix issue {{TASK_ID}}: {{ISSUE_TITLE}}
+Implement GitHub issue {{TASK_ID}}: {{ISSUE_TITLE}}
 
-Pull in the issue using `{{VIEW_TASK_COMMAND}}`. If it has a parent PRD, pull that in too.
+Work on branch {{BRANCH}}. Only this issue.
 
-Only work on the issue specified.
+# BOARD
 
-Work on branch {{BRANCH}}. Make commits and run tests.
+Before any other work, put the issue on the project board and set Status to **In Progress**:
+
+```bash
+item=$(gh project item-add 3 --owner janmichek --url https://github.com/janmichek/design-bot/issues/{{TASK_ID}} --format json --jq .id)
+gh project item-edit --project-id PVT_kwHOAOpt584BneoC --id "$item" \
+  --field-id PVTSSF_lAHOAOpt584BneoCzhmDD0I --single-select-option-id 47fc9ee4
+```
+
+Leave Status at **In Progress** when you stop. The host sets **Ready 4 Review** when it opens the PR.
+
+# SKILL
+
+Call the Skill tool with `implement` and follow it for this issue.
+
+AFK overrides (no human in the loop):
+
+- Fetch the issue with `gh issue view {{TASK_ID}}` (and any linked parent/spec it names). Do not ask clarifying questions — decide from the issue text.
+- Choose test seams from the issue/spec yourself; do not wait for confirmation.
+- After the work is committed, **stop**. Do **not** call `code-review` — the next Sandcastle agent owns that.
 
 # CONTEXT
-
-Here are the last 10 commits:
 
 <recent-commits>
 
@@ -18,45 +34,10 @@ Here are the last 10 commits:
 
 </recent-commits>
 
-# EXPLORATION
+# DONE
 
-Explore the repo and fill your context window with relevant information that will allow you to complete the task.
+Ship a working slice that matches the assignment. The reviewer agent will validate, desloppify, security-audit, and raise coverage — do not pre-empt that loop.
 
-Pay extra attention to test files that touch the relevant parts of the code.
-
-# EXECUTION
-
-If applicable, use RGR to complete the task.
-
-1. RED: write one test
-2. GREEN: write the implementation to pass that test
-3. REPEAT until done
-4. REFACTOR the code
-
-# FEEDBACK LOOPS
-
-Before committing, run `npm run typecheck` and `npm run test` to ensure the tests pass.
-
-# COMMIT
-
-Make a git commit. The commit message must:
-
-1. Start with `RALPH:` prefix
-2. Include task completed + PRD reference
-3. Key decisions made
-4. Files changed
-5. Blockers or notes for next iteration
-
-Keep it concise.
-
-# THE ISSUE
-
-If the task is not complete, leave a comment on the issue with what was done.
-
-Do not close the issue - this will be done later.
+If the issue is only partly done, leave a `gh` comment with what landed. Do not close the issue.
 
 Once complete, output <promise>COMPLETE</promise>.
-
-# FINAL RULES
-
-ONLY WORK ON A SINGLE TASK.

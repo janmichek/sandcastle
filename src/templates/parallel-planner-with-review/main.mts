@@ -1,102 +1,384 @@
 // Parallel Planner with Review — four-phase orchestration loop
 //
 // This template drives a multi-phase workflow:
-//   Phase 1 (Plan):             An opus agent analyzes open issues, builds a
+//   Phase 1 (Plan):             An agent analyzes open issues, builds a
 //                               dependency graph, and outputs a <plan> JSON
 //                               listing unblocked issues with branch names.
 //   Phase 2 (Execute + Review): For each issue, a sandbox is created via
 //                               createSandbox(). The implementer runs first
 //                               (100 iterations). If it produces commits, a
 //                               reviewer runs in the same sandbox on the same
-//                               branch (1 iteration). All issue pipelines run
-//                               concurrently via Promise.allSettled().
-//   Phase 3 (Merge):            A single agent merges all completed branches
-//                               into the current branch.
+//                               branch. All issue pipelines run concurrently
+//                               via Promise.allSettled().
+//   Phase 3 (Open PRs):         Host-side. Each completed issue branch is
+//                               pushed and a pull request against
+//                               PUBLISH.baseBranch is opened (or reused).
+//                               Board Status moves to Ready 4 Review.
+//                               A human reviews the PR and labels it
+//                               ready-for-agent when it is safe to merge.
+//   Phase 4 (Merge labelled):   An agent merges only PRs whose head is a
+//                               sandcastle/issue-* branch and that carry the
+//                               ready-for-agent label, then closes issues.
 //
-// The outer loop repeats up to MAX_ITERATIONS times so that newly unblocked
-// issues are picked up after each round of merges.
+// Phase 4 also runs at the start of each iteration so labelled PRs from a
+// prior cycle (or while you were AFK) get merged before new work is planned.
+//
+// The outer loop runs indefinitely. When idle (nothing to merge, nothing to
+// plan), it polls every IDLE_POLL_MS with cheap gh checks for new triggers
+// (ready-for-agent PRs or Todo Sandcastle issues) before waking agents again.
 //
 // Usage:
-//   npx tsx .sandcastle/main.mts
+//   npx tsx .sandcastle/main.ts
 // Or add to package.json:
-//   "scripts": { "sandcastle": "npx tsx .sandcastle/main.mts" }
+//   "scripts": { "sandcastle": "npx tsx .sandcastle/main.ts" }
 
-import * as sandcastle from "@ai-hero/sandcastle";
-import { docker } from "@ai-hero/sandcastle/sandboxes/docker";
-import { z } from "zod";
+import { execFileSync } from 'node:child_process';
+import * as sandcastle from '@ai-hero/sandcastle';
+import { docker } from '@ai-hero/sandcastle/sandboxes/docker';
+import { z } from 'zod';
 
 // The planner emits its plan as JSON inside <plan> tags; Output.object extracts
 // and validates it against this schema. We use Zod here, but any Standard
 // Schema validator works just as well — Valibot, ArkType, etc. See
 // https://standardschema.dev.
 const planSchema = z.object({
-  issues: z.array(
-    z.object({ id: z.string(), title: z.string(), branch: z.string() }),
-  ),
+  issues: z.array(z.object({ id: z.string(), title: z.string(), branch: z.string() })),
 });
+
+type PlannedIssue = z.infer<typeof planSchema>['issues'][number];
+
+type ReadyToMergePr = {
+  number: number;
+  title: string;
+  headRefName: string;
+  url: string;
+};
+
+const MERGE_READY_LABEL = 'ready-for-agent';
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
-// Maximum number of plan→execute→merge cycles before stopping.
-// Raise this if your backlog is large; lower it for a quick smoke-test run.
-const MAX_ITERATIONS = 10;
+// How long to wait between scans when there is nothing to merge or plan.
+const IDLE_POLL_MS = 60_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Cursor model used by every agent. The Cursor CLI reads CURSOR_API_KEY
+// from .sandcastle/.env (forwarded into the sandbox). Swap for any id from
+// `agent --list-models` (e.g. composer-2.5, claude-sonnet-5-thinking-high).
+const MODEL = 'auto';
 
 // Hooks run inside the sandbox before the agent starts each iteration.
 // npm install ensures the sandbox always has fresh dependencies.
 const hooks = {
-  sandbox: { onSandboxReady: [{ command: "npm install" }] },
+  sandbox: { onSandboxReady: [{ command: 'npm install' }] },
 };
 
 // Copy node_modules from the host into the worktree before each sandbox
 // starts. Avoids a full npm install from scratch; the hook above handles
 // platform-specific binaries and any packages added since the last copy.
-const copyToWorktree = ["node_modules"];
+const copyToWorktree = ['node_modules'];
+
+// Publishing runs on the host, with the host's git and gh credentials.
+const PUBLISH = {
+  // Push each sandcastle/issue-* branch as soon as its pipeline produces commits.
+  issueBranches: true,
+  // The pull request target for each issue branch.
+  baseBranch: 'main',
+};
+
+// ---------------------------------------------------------------------------
+// Publishers / PR helpers
+// ---------------------------------------------------------------------------
+
+function git(args: string[]): string {
+  return execFileSync('git', args, { encoding: 'utf8' }).trim();
+}
+
+function warn(context: string, error: unknown): void {
+  const message = error instanceof Error ? error.message : String(error);
+  console.error(`  ✗ ${context}: ${message}`);
+}
+
+function publishBranch(branch: string): void {
+  try {
+    execFileSync('git', ['push', '--set-upstream', 'origin', branch], { stdio: 'inherit' });
+    console.log(`  ↑ pushed ${branch}`);
+  } catch (error) {
+    warn(`Could not push ${branch}`, error);
+  }
+}
+
+const PROJECT_ID = 'PVT_kwHOAOpt584BneoC';
+const STATUS_FIELD_ID = 'PVTSSF_lAHOAOpt584BneoCzhmDD0I';
+const READY_4_REVIEW_OPTION_ID = '52ec52fb';
+
+function setIssueReady4Review(issueId: string): void {
+  try {
+    const item = execFileSync(
+      'gh',
+      [
+        'project',
+        'item-add',
+        '3',
+        '--owner',
+        'janmichek',
+        '--url',
+        `https://github.com/janmichek/design-bot/issues/${issueId}`,
+        '--format',
+        'json',
+        '--jq',
+        '.id',
+      ],
+      { encoding: 'utf8' },
+    ).trim();
+    execFileSync(
+      'gh',
+      [
+        'project',
+        'item-edit',
+        '--project-id',
+        PROJECT_ID,
+        '--id',
+        item,
+        '--field-id',
+        STATUS_FIELD_ID,
+        '--single-select-option-id',
+        READY_4_REVIEW_OPTION_ID,
+      ],
+      { stdio: 'inherit' },
+    );
+    console.log(`  → #${issueId} board Status → Ready 4 Review`);
+  } catch (error) {
+    warn(`Could not set Ready 4 Review for #${issueId}`, error);
+  }
+}
+
+function openIssuePr(issue: PlannedIssue): void {
+  const { branch, id, title } = issue;
+  try {
+    const existing = execFileSync(
+      'gh',
+      ['pr', 'list', '--head', branch, '--state', 'open', '--json', 'url', '--jq', '.[0].url'],
+      { encoding: 'utf8' },
+    ).trim();
+    if (existing !== '' && existing !== 'null') {
+      console.log(`  PR already open for ${branch}: ${existing}`);
+      setIssueReady4Review(id);
+      return;
+    }
+    execFileSync(
+      'gh',
+      [
+        'pr',
+        'create',
+        '--base',
+        PUBLISH.baseBranch,
+        '--head',
+        branch,
+        '--title',
+        title,
+        '--body',
+        `Fixes #${id}\n\nOpened by Sandcastle after implement + agent review. When you are happy, label this PR \`${MERGE_READY_LABEL}\`; the next Sandcastle cycle will merge it.`,
+      ],
+      { stdio: 'inherit' },
+    );
+    console.log(`  ✓ opened PR for ${branch} (Fixes #${id})`);
+    setIssueReady4Review(id);
+  } catch (error) {
+    warn(`Could not open a pull request for ${branch}`, error);
+  }
+}
+
+function listReadyToMergeSandcastlePrs(): ReadyToMergePr[] {
+  try {
+    const raw = execFileSync(
+      'gh',
+      [
+        'pr',
+        'list',
+        '--state',
+        'open',
+        '--base',
+        PUBLISH.baseBranch,
+        '--label',
+        MERGE_READY_LABEL,
+        '--json',
+        'number,title,headRefName,url',
+      ],
+      { encoding: 'utf8' },
+    );
+    const prs = JSON.parse(raw) as ReadyToMergePr[];
+    return prs.filter((pr) => pr.headRefName.startsWith('sandcastle/issue-'));
+  } catch (error) {
+    warn(`Could not list ${MERGE_READY_LABEL} PRs`, error);
+    return [];
+  }
+}
+
+/** Cheap host-side check: any Sandcastle PRs labelled ready-for-agent? */
+function hasMergeTriggers(): boolean {
+  return listReadyToMergeSandcastlePrs().length > 0;
+}
+
+/**
+ * Cheap host-side check: any open Sandcastle issues in Todo (or missing from
+ * the board)? Matches the planner's "ready for planning" rule without an agent.
+ * Fail open on errors so a flaky gh call wakes the planner instead of missing work.
+ */
+function hasPlanTriggers(): boolean {
+  try {
+    const issuesRaw = execFileSync(
+      'gh',
+      ['issue', 'list', '--state', 'open', '--label', 'Sandcastle', '--limit', '100', '--json', 'number'],
+      { encoding: 'utf8' },
+    );
+    const issues = JSON.parse(issuesRaw) as { number: number }[];
+    if (issues.length === 0) return false;
+
+    const boardRaw = execFileSync(
+      'gh',
+      [
+        'project',
+        'item-list',
+        '3',
+        '--owner',
+        'janmichek',
+        '--format',
+        'json',
+        '--limit',
+        '200',
+        '--jq',
+        '[.items[] | {number: .content.number, status}]',
+      ],
+      { encoding: 'utf8' },
+    );
+    const board = JSON.parse(boardRaw) as { number: number | null; status: string | null }[];
+    const statusByNumber = new Map<number, string | null>();
+    for (const item of board) {
+      if (item.number != null) statusByNumber.set(item.number, item.status);
+    }
+
+    return issues.some((issue) => {
+      const status = statusByNumber.get(issue.number);
+      return status == null || status === 'Todo';
+    });
+  } catch (error) {
+    warn('Could not scan for plan triggers', error);
+    return true;
+  }
+}
+
+async function waitForTriggers(): Promise<void> {
+  for (;;) {
+    console.log(`Idle: scanning for triggers again in ${IDLE_POLL_MS / 1000}s...`);
+    await sleep(IDLE_POLL_MS);
+    console.log('Scanning for merge / plan triggers...');
+    if (hasMergeTriggers() || hasPlanTriggers()) {
+      console.log('Trigger found; resuming.');
+      return;
+    }
+    console.log('No triggers yet.');
+  }
+}
+
+async function mergeReadyPrs(): Promise<number> {
+  const ready = listReadyToMergeSandcastlePrs();
+  if (ready.length === 0) {
+    console.log(`No Sandcastle PRs labelled ${MERGE_READY_LABEL} to merge.`);
+    return 0;
+  }
+
+  console.log(`Merging ${ready.length} ${MERGE_READY_LABEL} PR(s):`);
+  for (const pr of ready) {
+    console.log(`  #${pr.number}: ${pr.title} (${pr.headRefName}) → ${pr.url}`);
+  }
+
+  await sandcastle.run({
+    hooks,
+    sandbox: docker(),
+    name: 'merger',
+    maxIterations: 1,
+    agent: sandcastle.cursor(MODEL),
+    promptFile: './.sandcastle/merge-prompt.md',
+    promptArgs: {
+      BASE_BRANCH: PUBLISH.baseBranch,
+      MERGE_READY_LABEL,
+      PRS: ready.map((pr) => `- PR #${pr.number}: ${pr.title} (head \`${pr.headRefName}\`) — ${pr.url}`).join('\n'),
+    },
+  });
+
+  return ready.length;
+}
+
+// The merger works on the same working tree this script runs on, and may reset
+// the tree while resolving conflicts. A dirty tree would lose work silently.
+function assertCleanTree(): void {
+  if (process.env.SANDCASTLE_ALLOW_DIRTY === '1') return;
+  const dirty = git(['status', '--porcelain', '--untracked-files=no']);
+  if (dirty !== '') {
+    throw new Error(
+      'Working tree has uncommitted tracked changes. Commit or stash them (or set SANDCASTLE_ALLOW_DIRTY=1 to override); the merger may reset the tree.',
+    );
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Main loop
 // ---------------------------------------------------------------------------
 
-for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
-  console.log(`\n=== Iteration ${iteration}/${MAX_ITERATIONS} ===\n`);
+assertCleanTree();
+
+for (let iteration = 1; ; iteration++) {
+  console.log(`\n=== Iteration ${iteration} ===\n`);
+
+  // -------------------------------------------------------------------------
+  // Phase 4 (also at loop start): Merge PRs labelled ready-for-agent
+  // -------------------------------------------------------------------------
+  console.log(`Checking for Sandcastle PRs labelled ${MERGE_READY_LABEL}...`);
+  const mergedCount = await mergeReadyPrs();
 
   // -------------------------------------------------------------------------
   // Phase 1: Plan
   //
-  // The planning agent (opus, for deeper reasoning) reads the open issue list,
-  // builds a dependency graph, and selects the issues that can be worked in
-  // parallel right now (i.e., no blocking dependencies on other open issues).
+  // The planning agent reads the open issue list, builds a dependency graph,
+  // and selects the issues that can be worked in parallel right now.
   //
   // It outputs a <plan> JSON block — Output.object parses and validates it.
   // -------------------------------------------------------------------------
   const plan = await sandcastle.run({
     hooks,
     sandbox: docker(),
-    name: "planner",
+    name: 'planner',
     // One iteration is enough: the planner just needs to read and reason,
     // not write code. (Structured output requires maxIterations: 1.)
     maxIterations: 1,
-    // Opus for planning: dependency analysis benefits from deeper reasoning.
-    agent: sandcastle.claudeCode("claude-opus-4-8"),
-    promptFile: "./.sandcastle/plan-prompt.md",
+    agent: sandcastle.cursor(MODEL),
+    promptFile: './.sandcastle/plan-prompt.md',
     // Extract and validate the <plan> JSON into a typed object. Throws
     // StructuredOutputError if the tag is missing, the JSON is malformed, or
     // validation fails — which aborts the loop.
-    output: sandcastle.Output.object({ tag: "plan", schema: planSchema }),
+    output: sandcastle.Output.object({ tag: 'plan', schema: planSchema }),
   });
 
   const issues = plan.output.issues;
 
   if (issues.length === 0) {
-    // No unblocked work — either everything is done or everything is blocked.
-    console.log("No unblocked issues to work on. Exiting.");
-    break;
+    if (mergedCount > 0) {
+      // Merges may have unblocked work — plan again next iteration.
+      console.log('No unblocked issues this pass; merges landed. Continuing...');
+      continue;
+    }
+    console.log(`No unblocked issues and no ${MERGE_READY_LABEL} PRs.`);
+    await waitForTriggers();
+    continue;
   }
 
-  console.log(
-    `Planning complete. ${issues.length} issue(s) to work in parallel:`,
-  );
+  console.log(`Planning complete. ${issues.length} issue(s) to work in parallel:`);
   for (const issue of issues) {
     console.log(`  ${issue.id}: ${issue.title} → ${issue.branch}`);
   }
@@ -123,10 +405,10 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
       try {
         // Run the implementer
         const implement = await sandbox.run({
-          name: "implementer",
+          name: 'implementer',
           maxIterations: 100,
-          agent: sandcastle.claudeCode("claude-sonnet-4-6"),
-          promptFile: "./.sandcastle/implement-prompt.md",
+          agent: sandcastle.cursor(MODEL),
+          promptFile: './.sandcastle/implement-prompt.md',
           promptArgs: {
             TASK_ID: issue.id,
             ISSUE_TITLE: issue.title,
@@ -136,17 +418,20 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
 
         // Only review if the implementer produced commits
         if (implement.commits.length > 0) {
+          // Many iterations: Validate → code-review → security loop, then
+          // coverage (+ optional UI demo/polish when the branch has a UI).
           const review = await sandbox.run({
-            name: "reviewer",
-            maxIterations: 1,
-            agent: sandcastle.claudeCode("claude-sonnet-4-6"),
-            promptFile: "./.sandcastle/review-prompt.md",
+            name: 'reviewer',
+            maxIterations: 50,
+            agent: sandcastle.cursor(MODEL),
+            promptFile: './.sandcastle/review-prompt.md',
             promptArgs: {
+              TASK_ID: issue.id,
               BRANCH: issue.branch,
             },
           });
 
-          // Merge commits from both runs so the merge phase sees all of them.
+          // Combine commits from both runs for the publish gate.
           // Each sandbox.run() only returns commits from its own run.
           return {
             ...review,
@@ -163,64 +448,33 @@ for (let iteration = 1; iteration <= MAX_ITERATIONS; iteration++) {
 
   // Log any agents that threw (network error, sandbox crash, etc.).
   for (const [i, outcome] of settled.entries()) {
-    if (outcome.status === "rejected") {
-      console.error(
-        `  ✗ ${issues[i]!.id} (${issues[i]!.branch}) failed: ${outcome.reason}`,
-      );
+    if (outcome.status === 'rejected') {
+      console.error(`  ✗ ${issues[i]!.id} (${issues[i]!.branch}) failed: ${outcome.reason}`);
     }
   }
 
-  // Only pass branches that actually produced commits to the merge phase.
-  // An agent that ran successfully but made no commits has nothing to merge.
+  // Only open PRs for branches that actually produced commits.
   const completedIssues = settled
     .map((outcome, i) => ({ outcome, issue: issues[i]! }))
-    .filter(
-      (entry) =>
-        entry.outcome.status === "fulfilled" &&
-        entry.outcome.value.commits.length > 0,
-    )
+    .filter((entry) => entry.outcome.status === 'fulfilled' && entry.outcome.value.commits.length > 0)
     .map((entry) => entry.issue);
 
-  const completedBranches = completedIssues.map((i) => i.branch);
-
-  console.log(
-    `\nExecution complete. ${completedBranches.length} branch(es) with commits:`,
-  );
-  for (const branch of completedBranches) {
-    console.log(`  ${branch}`);
+  console.log(`\nExecution complete. ${completedIssues.length} branch(es) with commits:`);
+  for (const issue of completedIssues) {
+    console.log(`  ${issue.branch}`);
   }
 
-  if (completedBranches.length === 0) {
-    // All agents ran but none made commits — nothing to merge this cycle.
-    console.log("No commits produced. Nothing to merge.");
+  if (completedIssues.length === 0) {
+    console.log('No commits produced. Nothing to open as a PR.');
     continue;
   }
 
   // -------------------------------------------------------------------------
-  // Phase 3: Merge
-  //
-  // One agent merges all completed branches into the current branch,
-  // resolving any conflicts and running tests to confirm everything works.
-  //
-  // The {{BRANCHES}} and {{ISSUES}} prompt arguments are lists that the agent
-  // uses to know which branches to merge and which issues to close.
+  // Phase 3: Push + open PRs (human reviews; do not merge here)
   // -------------------------------------------------------------------------
-  await sandcastle.run({
-    hooks,
-    sandbox: docker(),
-    name: "merger",
-    maxIterations: 1,
-    agent: sandcastle.claudeCode("claude-sonnet-4-6"),
-    promptFile: "./.sandcastle/merge-prompt.md",
-    promptArgs: {
-      // A markdown list of branch names, one per line.
-      BRANCHES: completedBranches.map((b) => `- ${b}`).join("\n"),
-      // A markdown list of issue IDs and titles, one per line.
-      ISSUES: completedIssues.map((i) => `- ${i.id}: ${i.title}`).join("\n"),
-    },
-  });
-
-  console.log("\nBranches merged.");
+  console.log('\nPublishing issue branches and opening PRs...');
+  for (const issue of completedIssues) {
+    if (PUBLISH.issueBranches) publishBranch(issue.branch);
+    openIssuePr(issue);
+  }
 }
-
-console.log("\nAll done.");

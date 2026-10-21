@@ -1,16 +1,28 @@
+# BOARD STATUS
+
+Kanban board for this repo (`@janmichek's untitled project`, number 3). Status is the source of truth for what is free to pick up.
+
+<board-json>
+
+!`gh project item-list 3 --owner janmichek --format json --limit 200 --jq '[.items[] | {number: .content.number, title: .content.title, status, id}]'`
+
+</board-json>
+
 # ISSUES
 
-Here are the open issues in the repo:
+Open issues labelled `Sandcastle` (Sandcastle's work queue). Cross-check each against the board above.
 
 <issues-json>
 
-!`gh issue list --state open --label ready-for-agent --limit 100 --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'`
+!`gh issue list --state open --label Sandcastle --limit 100 --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'`
 
 </issues-json>
 
+**Ready for planning** = labelled `Sandcastle`, open, and board Status is **Todo** (or the issue is missing from the board — treat missing as Todo and plan it; the implementer will `item-add`). Skip anything whose board Status is In Progress, Ready 4 Review, or Done. **Ready 4 Review** means a PR is open and waiting for a human to label it `ready-for-agent` — do not re-plan it.
+
 # TASK
 
-Analyze the open issues and build a dependency graph. For each issue, determine whether it **blocks** or **is blocked by** any other open issue.
+Analyze the ready issues and build a dependency graph. For each issue, determine whether it **blocks** or **is blocked by** any other open issue.
 
 An issue B is **blocked by** issue A if:
 
@@ -20,16 +32,16 @@ An issue B is **blocked by** issue A if:
 
 An issue is **unblocked** if it has zero blocking dependencies on other open issues.
 
-For each unblocked issue, assign a branch name using the exact format `sandcastle/issue-{number}` (no slug or other suffix). This must be deterministic so that re-planning the same issue always produces the same branch name and accumulated progress is preserved.
-
-If the issue appears to be a PRD and it has implementation issues which link to it, the PRD cannot be worked on.
+For each unblocked issue, assign a branch name using the exact format `sandcastle/issue-{id}` (no slug or other suffix). This must be deterministic so that re-planning the same issue always produces the same branch name and accumulated progress is preserved.
 
 # OUTPUT
 
 Output your plan as a JSON object wrapped in `<plan>` tags:
 
 <plan>
-{"issues": [{"number": 42, "title": "Fix auth bug", "branch": "sandcastle/issue-42"}]}
+{"issues": [{"id": "42", "title": "Fix auth bug", "branch": "sandcastle/issue-42"}]}
 </plan>
 
 Include only unblocked issues. If every issue is blocked, include the single highest-priority candidate (the one with the fewest or weakest dependencies).
+
+Always emit the `<plan>` tags, even when there is nothing to do. If there are no issues to work on at all, output `<plan>{"issues": []}</plan>` so the host can idle and scan again later.
