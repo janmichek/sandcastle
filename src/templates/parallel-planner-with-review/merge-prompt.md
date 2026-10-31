@@ -19,7 +19,7 @@ Ready-to-merge PRs:
    - Run `npm run check` (or at least typecheck + tests) and fix failures
    - Push the PR branch, then `gh pr merge <NUMBER> --merge --delete-branch`
 3. After a successful merge, close the linked issue if it is still open:
-   `gh issue close <ID> --comment "Merged via {{MERGE_READY_LABEL}} PR by Sandcastle"`
+   `{{CLOSE_TASK_COMMAND}}`
    Issue ID is the number in the head branch `sandcastle/issue-<ID>`, or from `Fixes #<ID>` in the PR body.
 4. Set board Status to **Done**:
 

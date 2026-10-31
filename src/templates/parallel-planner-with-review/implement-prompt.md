@@ -1,6 +1,6 @@
 # TASK
 
-Implement GitHub issue {{TASK_ID}}: {{ISSUE_TITLE}}
+Implement issue {{TASK_ID}}: {{ISSUE_TITLE}}
 
 Work on branch {{BRANCH}}. Only this issue.
 
@@ -22,7 +22,7 @@ Call the Skill tool with `implement` and follow it for this issue.
 
 AFK overrides (no human in the loop):
 
-- Fetch the issue with `gh issue view {{TASK_ID}}` (and any linked parent/spec it names). Do not ask clarifying questions — decide from the issue text.
+- Fetch the issue with `{{VIEW_TASK_COMMAND}}` (task `{{TASK_ID}}`, and any linked parent/spec it names). Do not ask clarifying questions — decide from the issue text.
 - Choose test seams from the issue/spec yourself; do not wait for confirmation.
 - After the work is committed, **stop**. Do **not** call `code-review` — the next Sandcastle agent owns that.
 

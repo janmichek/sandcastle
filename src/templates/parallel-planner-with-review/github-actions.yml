@@ -1,0 +1,65 @@
+# Scaffolded by `sandcastle init` at .github/workflows/sandcastle.yml.
+#
+# Runs the parallel-planner-with-review loop in GitHub Actions. GitHub caps
+# jobs at 360 minutes, so the script hands off to a fresh run after
+# SANDCASTLE_RUN_BUDGET_MINUTES instead of being killed mid-phase.
+name: sandcastle
+
+on:
+  issues:
+    types: [labeled]
+  # Runs the workflow from main, never from an agent's branch.
+  pull_request_target:
+    types: [labeled]
+  workflow_dispatch:
+
+jobs:
+  run:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issues' && github.event.label.name == 'Sandcastle') ||
+      (github.event_name == 'pull_request_target' &&
+       github.event.label.name == 'ready-for-agent' &&
+       startsWith(github.event.pull_request.head.ref, 'sandcastle/issue-'))
+    # Job-level, so labels skipped by `if` never replace a pending run.
+    concurrency: sandcastle
+    runs-on: ubuntu-latest
+    # Hard cap is 360. The script hands off after 285 minutes, leaving ~55
+    # minutes for the last phase to finish before this timeout.
+    timeout-minutes: 340
+    # Lets the script dispatch its own successor via GITHUB_TOKEN.
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          # A PAT with contents:write so pushes and PRs can trigger workflows.
+          token: ${{ secrets.SANDCASTLE_GH_TOKEN }}
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx sandcastle {{SANDBOX_CLI}} build-image
+      - run: |
+          git config user.name "sandcastle-bot"
+          git config user.email "sandcastle-bot@users.noreply.github.com"
+      # Sandcastle forwards only keys listed in .sandcastle/.env. Blank values
+      # are read from process.env, so no secret is written to disk.
+      - run: cp .sandcastle/.env.example .sandcastle/.env
+      - run: npx tsx .sandcastle/{{MAIN_FILE}}
+        env:
+          SANDCASTLE_SELF_RESTART: "1"
+          SANDCASTLE_RUN_BUDGET_MINUTES: "285"
+          # {{AGENT_SECRET_ENV}}
+          GH_TOKEN: ${{ secrets.SANDCASTLE_GH_TOKEN }}
+          # Only used to dispatch the successor run (needs actions: write).
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sandcastle-logs-${{ github.run_id }}
+          path: .sandcastle/logs

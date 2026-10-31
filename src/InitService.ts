@@ -18,6 +18,13 @@ worktrees/
 const SETUP_ISSUE_TRACKER_DOC = "SETUP_ISSUE_TRACKER.md";
 const SETUP_ISSUE_TRACKER_PATH = `.sandcastle/${SETUP_ISSUE_TRACKER_DOC}`;
 
+/**
+ * Template file scaffolded into `.github/workflows/sandcastle.yml` instead of
+ * the `.sandcastle/` config directory.
+ */
+const GITHUB_ACTIONS_TEMPLATE_FILE = "github-actions.yml";
+const GITHUB_ACTIONS_WORKFLOW = "sandcastle.yml";
+
 export interface TemplateMetadata {
   name: string;
   description: string;
@@ -220,6 +227,11 @@ export interface AgentEntry {
   readonly dockerfileTemplate: string;
   /** Lines to include in the generated `.env.example` for this agent's API key. */
   readonly envExample: string;
+  /**
+   * GitHub Actions secret names forwarded to the run step. The scaffolded
+   * workflow reads each from `secrets.<name>` so the agent works in CI.
+   */
+  readonly githubActionsSecrets: readonly string[];
   /**
    * Copy-pasteable interactive command that feeds the custom-issue-tracker
    * setup prompt to this agent's CLI on the host. Printed in init's next steps
@@ -444,6 +456,7 @@ CLAUDE_CODE_OAUTH_TOKEN=
 # Or use an Anthropic API key instead — uncomment and fill in:
 # ANTHROPIC_API_KEY=`,
     setupCommand: `claude "$(cat ${SETUP_ISSUE_TRACKER_PATH})"`,
+    githubActionsSecrets: ["CLAUDE_CODE_OAUTH_TOKEN"],
   },
   {
     name: "pi",
@@ -454,6 +467,7 @@ CLAUDE_CODE_OAUTH_TOKEN=
     envExample: `# Anthropic API key
 ANTHROPIC_API_KEY=`,
     setupCommand: `pi "$(cat ${SETUP_ISSUE_TRACKER_PATH})"`,
+    githubActionsSecrets: ["ANTHROPIC_API_KEY"],
   },
   {
     name: "codex",
@@ -464,6 +478,7 @@ ANTHROPIC_API_KEY=`,
     envExample: `# OpenAI API key from platform.openai.com (\`codex exec\` reads CODEX_API_KEY)
 CODEX_API_KEY=`,
     setupCommand: `codex "$(cat ${SETUP_ISSUE_TRACKER_PATH})"`,
+    githubActionsSecrets: ["CODEX_API_KEY"],
   },
   {
     name: "cursor",
@@ -475,6 +490,7 @@ CODEX_API_KEY=`,
 # You can also pass --api-key directly to the agent CLI.
 CURSOR_API_KEY=`,
     setupCommand: `agent "$(cat ${SETUP_ISSUE_TRACKER_PATH})"`,
+    githubActionsSecrets: ["CURSOR_API_KEY"],
   },
   {
     name: "opencode",
@@ -485,6 +501,7 @@ CURSOR_API_KEY=`,
     envExample: `# OpenCode API key
 OPENCODE_API_KEY=`,
     setupCommand: `opencode --prompt "$(cat ${SETUP_ISSUE_TRACKER_PATH})"`,
+    githubActionsSecrets: ["OPENCODE_API_KEY"],
   },
   {
     name: "copilot",
@@ -498,6 +515,7 @@ OPENCODE_API_KEY=`,
 # so this key is used even when GH_TOKEN is set for the issue tracker.
 COPILOT_GITHUB_TOKEN=`,
     setupCommand: `copilot -i "$(cat ${SETUP_ISSUE_TRACKER_PATH})"`,
+    githubActionsSecrets: ["COPILOT_GITHUB_TOKEN"],
   },
 ];
 
@@ -805,6 +823,14 @@ export const getNextStepsLines = (
       `${step++}. Customize .sandcastle/CODING_STANDARDS.md with your project's standards — the reviewer agent loads it during review`,
     );
   }
+  if (template === "parallel-planner-with-review") {
+    const secrets = ["SANDCASTLE_GH_TOKEN", ...agent.githubActionsSecrets].join(
+      ", ",
+    );
+    lines.push(
+      `${step++}. Commit .github/workflows/${GITHUB_ACTIONS_WORKFLOW}, then add these repository secrets: ${secrets} (see README → Running in GitHub Actions)`,
+    );
+  }
   lines.push(`${step++}. ${runStep}`);
   return lines;
 };
@@ -859,6 +885,7 @@ const copyTemplateFiles = (
           (f) =>
             f !== "template.json" &&
             f !== ".env.example" &&
+            f !== GITHUB_ACTIONS_TEMPLATE_FILE &&
             !COMPILED_FILE_EXTENSIONS.some((ext) => f.endsWith(ext)),
         )
         .map((f) => {
@@ -871,6 +898,53 @@ const copyTemplateFiles = (
         }),
       { concurrency: "unbounded" },
     );
+  });
+
+/**
+ * Write the template's GitHub Actions workflow, if it has one, to
+ * `.github/workflows/sandcastle.yml`. Placeholders fill in the main filename,
+ * sandbox CLI namespace, and the agent secret(s) the run step needs.
+ */
+const writeGithubActionsWorkflow = (
+  templateDir: string,
+  repoDir: string,
+  mainFilename: string,
+  agent: AgentEntry,
+  sandboxProvider: SandboxProviderEntry,
+): Effect.Effect<void, InitError, FileSystem.FileSystem> =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const source = join(templateDir, GITHUB_ACTIONS_TEMPLATE_FILE);
+    const exists = yield* fs
+      .exists(source)
+      .pipe(Effect.orElseSucceed(() => false));
+    if (!exists) return;
+
+    const template = yield* fs
+      .readFileString(source)
+      .pipe(Effect.mapError((e) => new InitError({ message: e.message })));
+
+    const agentEnv = agent.githubActionsSecrets
+      .map((key) => "          " + key + ": ${{ secrets." + key + " }}")
+      .join("\n");
+
+    const content = template
+      .replace(/\{\{MAIN_FILE\}\}/g, mainFilename)
+      .replace(/\{\{SANDBOX_CLI\}\}/g, sandboxProvider.cliNamespace)
+      .replace("          # {{AGENT_SECRET_ENV}}", agentEnv);
+
+    const destination = join(
+      repoDir,
+      ".github",
+      "workflows",
+      GITHUB_ACTIONS_WORKFLOW,
+    );
+    yield* fs
+      .makeDirectory(dirname(destination), { recursive: true })
+      .pipe(Effect.mapError((e) => new InitError({ message: e.message })));
+    yield* fs
+      .writeFileString(destination, content)
+      .pipe(Effect.mapError((e) => new InitError({ message: e.message })));
   });
 
 /**
@@ -1277,6 +1351,15 @@ export const scaffold = (
         copyTemplateFiles(templateDir, configDir, mainFilename),
       ],
       { concurrency: "unbounded" },
+    );
+
+    // scaffolded workflows live outside .sandcastle/ (e.g. .github/workflows/)
+    yield* writeGithubActionsWorkflow(
+      templateDir,
+      repoDir,
+      mainFilename,
+      agent,
+      sandboxProvider,
     );
 
     // Rewrite main file with the selected agent factory, model, and sandbox provider

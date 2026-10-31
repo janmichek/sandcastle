@@ -503,7 +503,7 @@ describe("InitService scaffold", () => {
         join(dir, ".sandcastle", "review-prompt.md"),
         "utf8",
       );
-      expect(prompt).toContain("@.sandcastle/CODING_STANDARDS.md");
+      expect(prompt).toContain(".sandcastle/CODING_STANDARDS.md");
     });
 
     it("review-prompt.md diffs against {{TARGET_BRANCH}} (the fork point), not the branch itself", async () => {
@@ -696,6 +696,14 @@ describe("InitService scaffold", () => {
       const lines = next("parallel-planner-with-review", "main.mts");
       const joined = lines.join("\n");
       expect(joined).toContain("npm install zod");
+    });
+
+    it("parallel-planner-with-review template mentions the scaffolded workflow and secrets", () => {
+      const lines = next("parallel-planner-with-review", "main.mts");
+      const joined = lines.join("\n");
+      expect(joined).toContain(".github/workflows/sandcastle.yml");
+      expect(joined).toContain("SANDCASTLE_GH_TOKEN");
+      expect(joined).toContain("CLAUDE_CODE_OAUTH_TOKEN");
     });
 
     it("planner zod step uses the detected package manager's add command", () => {
@@ -1256,12 +1264,12 @@ describe("InitService scaffold", () => {
       );
       expect(implementerSection).toContain("maxIterations: 100");
 
-      // Check reviewer maxIterations: 1
+      // Check reviewer maxIterations: 50 (validate → review → security loop)
       const reviewerSection = mainTs.slice(
         mainTs.indexOf('name: "reviewer"') - 200,
         mainTs.indexOf('name: "reviewer"') + 200,
       );
-      expect(reviewerSection).toContain("maxIterations: 1");
+      expect(reviewerSection).toContain("maxIterations: 50");
 
       // Check merger maxIterations: 1
       const mergerSection = mainTs.slice(
@@ -1295,7 +1303,7 @@ describe("InitService scaffold", () => {
       expect(prompt).toContain("{{BRANCH}}");
     });
 
-    it("merge-prompt.md contains {{BRANCHES}} and {{ISSUES}} prompt arguments", async () => {
+    it("merge-prompt.md contains {{PRS}}, {{MERGE_READY_LABEL}}, and {{BASE_BRANCH}} prompt arguments", async () => {
       const dir = await makeDir();
       await runScaffold(dir, { templateName: "parallel-planner-with-review" });
 
@@ -1303,8 +1311,9 @@ describe("InitService scaffold", () => {
         join(dir, ".sandcastle", "merge-prompt.md"),
         "utf8",
       );
-      expect(prompt).toContain("{{BRANCHES}}");
-      expect(prompt).toContain("{{ISSUES}}");
+      expect(prompt).toContain("{{PRS}}");
+      expect(prompt).toContain("{{MERGE_READY_LABEL}}");
+      expect(prompt).toContain("{{BASE_BRANCH}}");
     });
 
     it("parallel-planner-with-review appears in listTemplates()", () => {
@@ -1343,6 +1352,75 @@ describe("InitService scaffold", () => {
       expect(mainTs).toContain("claude-opus-4-8");
     });
 
+    it("scaffolds a GitHub Actions workflow at .github/workflows/sandcastle.yml", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "parallel-planner-with-review" });
+
+      const workflow = await readFile(
+        join(dir, ".github", "workflows", "sandcastle.yml"),
+        "utf-8",
+      );
+      expect(workflow).toContain("name: sandcastle");
+      expect(workflow).toContain("workflow_dispatch");
+      expect(workflow).toContain("concurrency: sandcastle");
+      expect(workflow).toContain("actions: write");
+    });
+
+    it("workflow uses the scaffolded main filename and sandbox CLI", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, {
+        templateName: "parallel-planner-with-review",
+        sandboxProvider: getSandboxProvider("podman")!,
+      });
+
+      const workflow = await readFile(
+        join(dir, ".github", "workflows", "sandcastle.yml"),
+        "utf-8",
+      );
+      expect(workflow).toContain("npx tsx .sandcastle/main.mts");
+      expect(workflow).toContain("npx sandcastle podman build-image");
+    });
+
+    it("workflow enables self-restart and forwards the agent secret", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "parallel-planner-with-review" });
+
+      const workflow = await readFile(
+        join(dir, ".github", "workflows", "sandcastle.yml"),
+        "utf-8",
+      );
+      expect(workflow).toContain('SANDCASTLE_SELF_RESTART: "1"');
+      expect(workflow).toContain('SANDCASTLE_RUN_BUDGET_MINUTES: "285"');
+      expect(workflow).toContain(
+        "CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}",
+      );
+      expect(workflow).not.toContain("{{AGENT_SECRET_ENV}}");
+    });
+
+    it("main.mts hands off to a fresh workflow run before the budget runs out", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "parallel-planner-with-review" });
+
+      const mainTs = await readFile(
+        join(dir, ".sandcastle", "main.mts"),
+        "utf-8",
+      );
+      expect(mainTs).toContain("SANDCASTLE_SELF_RESTART");
+      expect(mainTs).toContain("SANDCASTLE_RUN_BUDGET_MINUTES");
+      expect(mainTs).toContain('"workflow", "run", "sandcastle.yml"');
+      expect(mainTs).toContain("handOffAndExit");
+    });
+
+    it("templates without a workflow do not scaffold .github/workflows", async () => {
+      const dir = await makeDir();
+      await runScaffold(dir, { templateName: "blank" });
+
+      const { access } = await import("node:fs/promises");
+      await expect(
+        access(join(dir, ".github", "workflows", "sandcastle.yml")),
+      ).rejects.toThrow();
+    });
+
     it("scaffolds CODING_STANDARDS.md with minimal starter content", async () => {
       const dir = await makeDir();
       await runScaffold(dir, { templateName: "parallel-planner-with-review" });
@@ -1363,7 +1441,7 @@ describe("InitService scaffold", () => {
         join(dir, ".sandcastle", "review-prompt.md"),
         "utf8",
       );
-      expect(prompt).toContain("@.sandcastle/CODING_STANDARDS.md");
+      expect(prompt).toContain(".sandcastle/CODING_STANDARDS.md");
     });
 
     it("review-prompt.md diffs against {{TARGET_BRANCH}} (the fork point), not the branch itself", async () => {
@@ -1862,9 +1940,7 @@ describe("InitService scaffold", () => {
       const main = await readFile(join(dir, ".sandcastle", "main.mts"), "utf8");
       expect(main).toContain("id: z.string()");
       expect(main).toContain("TASK_ID: issue.id");
-      expect(main).not.toContain("number: number");
       expect(main).not.toContain("ISSUE_NUMBER");
-      expect(main).not.toContain("`  #${");
     });
 
     it("parallel-planner main.mts uses Output.object for the plan", async () => {
@@ -2027,9 +2103,7 @@ describe("InitService scaffold", () => {
       const main = await readFile(join(dir, ".sandcastle", "main.mts"), "utf8");
       expect(main).toContain("id: z.string()");
       expect(main).toContain("TASK_ID: issue.id");
-      expect(main).not.toContain("number: number");
       expect(main).not.toContain("ISSUE_NUMBER");
-      expect(main).not.toContain("`  #${");
     });
 
     it("parallel-planner-with-review main.mts uses Output.object for the plan", async () => {

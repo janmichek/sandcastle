@@ -767,6 +767,78 @@ try {
 
 Select a template during `sandcastle init` when prompted, or re-run init in a fresh repo to try a different one.
 
+## Running in GitHub Actions
+
+The `parallel-planner-with-review` template scaffolds a ready-to-run workflow
+at `.github/workflows/sandcastle.yml` (source:
+[`src/templates/parallel-planner-with-review/github-actions.yml`](src/templates/parallel-planner-with-review/github-actions.yml)).
+It runs the orchestration loop from `main`, never from an agent branch, and
+triggers on:
+
+- an issue labelled `Sandcastle` (plan new work)
+- a `sandcastle/issue-*` pull request labelled `ready-for-agent` (merge it)
+- `workflow_dispatch` (manual run)
+
+Add two repository secrets before the first run:
+
+| Secret                                                                                                   | Purpose                                                                                          |
+| -------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `SANDCASTLE_GH_TOKEN`                                                                                    | PAT used by the agents and host helpers for checkout, pushes, PRs, issues, and the project board |
+| agent key (e.g. `ANTHROPIC_API_KEY`, `CURSOR_API_KEY`, `OPENCODE_API_KEY`, or `CLAUDE_CODE_OAUTH_TOKEN`) | Forwarded to the sandboxed agent; init prints the exact name for the agent you selected          |
+
+The job has a 340-minute timeout (GitHub's hard cap is 360). With
+`SANDCASTLE_SELF_RESTART=1`, the loop stops between phases after
+`SANDCASTLE_RUN_BUDGET_MINUTES` (default `285`) and dispatches its own successor
+with `gh workflow run sandcastle.yml`. The successor waits for the current run
+to exit because both share the job-level `concurrency: sandcastle` group, so the
+two never overlap and no sandbox is killed mid-run. Logs are uploaded as the
+`sandcastle-logs-<run-id>` artifact.
+
+| Variable                        | Default | Purpose                                                              |
+| ------------------------------- | ------- | -------------------------------------------------------------------- |
+| `SANDCASTLE_SELF_RESTART`       | unset   | `1` enables budget checks and the CI hand-off. Ignored locally       |
+| `SANDCASTLE_RUN_BUDGET_MINUTES` | `285`   | Wall-clock budget before handing off to the next workflow run        |
+| `SANDCASTLE_ALLOW_DIRTY`        | unset   | `1` lets the merger run with uncommitted tracked changes in the tree |
+
+Local runs and CI use the same command; only the self-restart variables differ:
+
+```bash
+# Local: polls forever when idle
+npx tsx .sandcastle/main.ts
+
+# CI-style: hand off before the Actions timeout
+SANDCASTLE_SELF_RESTART=1 SANDCASTLE_RUN_BUDGET_MINUTES=285 \
+  npx tsx .sandcastle/main.ts
+
+# Queue a run by hand and follow it
+gh workflow run sandcastle.yml
+gh run list --workflow sandcastle.yml
+gh run watch
+gh run download --name "sandcastle-logs-<run-id>"
+```
+
+Build the sandbox image locally with `npx sandcastle docker build-image` (or
+`npx sandcastle podman build-image`). The workflow runs this step for you.
+
+### Installing Sandcastle from a git fork
+
+Git-hosted dependencies are packed from the `files` field, so a fork that only
+publishes `dist/` arrives in `node_modules` without a build step and without
+its source. If your `package.json` points at a fork, add a step before
+`sandcastle docker build-image` that fetches the exact locked commit and builds
+it:
+
+```bash
+sha=$(node -p "require('./package-lock.json').packages['node_modules/@ai-hero/sandcastle'].resolved.split('#')[1]")
+curl -fsSL "https://codeload.github.com/<owner>/sandcastle/tar.gz/$sha" -o /tmp/sandcastle.tar.gz
+mkdir -p /tmp/sandcastle
+tar -xzf /tmp/sandcastle.tar.gz -C /tmp/sandcastle --strip-components=1
+npm ci --prefix /tmp/sandcastle --ignore-scripts --no-audit --no-fund
+npm run build --prefix /tmp/sandcastle
+rm -rf node_modules/@ai-hero/sandcastle/dist
+cp -r /tmp/sandcastle/dist node_modules/@ai-hero/sandcastle/dist
+```
+
 ## CLI commands
 
 ### `sandcastle init`
@@ -799,6 +871,10 @@ Creates the following files:
 ├── .env.example    # Token placeholders
 └── .gitignore      # Ignores .env, logs/, worktrees/
 ```
+
+With `--template parallel-planner-with-review`, init also writes
+`.github/workflows/sandcastle.yml` (see
+[Running in GitHub Actions](#running-in-github-actions)).
 
 Errors if `.sandcastle/` already exists to prevent overwriting customizations.
 

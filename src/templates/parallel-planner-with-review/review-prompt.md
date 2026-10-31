@@ -2,7 +2,7 @@
 
 Harden the work on branch `{{BRANCH}}` against `{{TARGET_BRANCH}}` and GitHub issue {{TASK_ID}}.
 
-You are the strict second opinion (Cursor agent). Be pedantic. Prefer deleting and simplifying over adding.
+You are the strict second opinion. Be pedantic. Prefer deleting and simplifying over adding.
 
 # BOARD
 
@@ -28,8 +28,8 @@ Do not move to Done or Ready 4 Review. Host opens a PR next and sets **Ready 4 R
 
 ## Commits on this branch
 
-!`git log {{TARGET_BRANCH}}..{{BRANCH}} --oneline`
----
+## !`git log {{TARGET_BRANCH}}..{{BRANCH}} --oneline`
+
 name: pr
 description: "Use when writing a PR body."
 metadata:
@@ -38,6 +38,7 @@ skill: show-me
 author: Dex Horthy
 organisation: Humanlayer
 url: "https://github.com/humanlayer/skills/blob/main/plugins/show-me/skills/show-me/SKILL.md"
+
 ---
 
 Use this template for writing the PR body:
@@ -199,7 +200,6 @@ Execution-based evidence is A-tier. Test results, console output. Show the exact
 Describe whether it's a one-way or two-way door. You can walk back through two-way doors, but not one-way doors. A PR that is cheap to roll back is lower risk. Changes that involve destructive actions or hard-to-reverse decisions are one-way doors.
 
 The blast radius is the potential impact or scope of the changes introduced by this PR. Consider all possibilities. Examples are layout shift, breakages for consumers, mobile responsiveness, etc.
-
 
 # LOOP (repeat until clean)
 
